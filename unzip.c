@@ -6756,6 +6756,8 @@ static s8 const unzip_usage = S8(
     " numbers\n"
     "  -D  skip restoring directory times         -DD skip restoring all"
     " times\n"
+    "  -y  extract a loose archive into a directory named for the"
+    " archive\n"
 );
 static s8 const unzip_usage_posix = S8(
     "  -X  restore UID/GID info                   -K  keep setuid/setgid/"
@@ -6951,6 +6953,7 @@ typedef struct {
     b32     Cflag;
     b32     Vflag;
     b32     Kflag;
+    b32     yflag;   // -y: wrap loose archives in a directory named for one
     i32     showhelp;
     b32     hasexdir;
     s8      exdir;
@@ -7228,7 +7231,7 @@ static b32 unsupported(unzip *u, u8 c)
 // supported, but for -d and -x, which there are Info-ZIP's.
 static b32 late_option(unzip *u, s8 arg)
 {
-    s8 letters = S("-bcCDefhjKlnopqtuvVXz");
+    s8 letters = S("-bcCDefhjKlnopqtuvVXzy");
     if (arg.len<2 || arg.s[0]!='-') {
         return 0;
     }
@@ -7358,6 +7361,10 @@ static i32 apply_options(unzip *u, s8 *args, i32 nargs, i32 *i, b32 *error,
             break;
         case 'X':
             u->Xflag = neg ? minus(u->Xflag, neg) : u->Xflag+1;
+            neg = 0;
+            break;
+        case 'y':
+            u->yflag = !neg;
             neg = 0;
             break;
         case 'z':
@@ -9320,10 +9327,100 @@ static i32 make_root(unzip *u, arena scratch)
     return PK_OK;
 }
 
+// The name to wrap an archive's contents under, with -y: the basename of
+// the name actually opened, less .zip or .ZIP should it have one, which
+// would leave nothing (as .zip alone would) not either.
+static s8 zip_dirname(unzip *u)
+{
+    s8 path = u->zipfn;
+    iz base = 0;
+    for (iz i = 0; i < path.len; i++) {
+        base = path.s[i]=='/' || path.s[i]=='\\' ? i+1 : base;
+    }
+    s8 name = {path.s+base, path.len-base};
+    s8 full  = name;
+    if (name.len>4 && name.s[name.len-4]=='.' &&
+        zi_lower(name.s[name.len-3])=='z' &&
+        zi_lower(name.s[name.len-2])=='i' &&
+        zi_lower(name.s[name.len-1])=='p') {
+        name.len -= 4;
+    }
+    return name.len ? name : full;
+}
+
+// With -y and no -d, whether an archive's contents are one directory:
+// every selected entry mapped, as plan maps them, under the same first
+// path component. Should they not be, they are extracted below a
+// directory named for the archive. Called once an archive, before plan,
+// which sizes its room by the root's length, so that the root must be
+// settled here. The root and its made-ness are reset however, so that
+// one archive of a run may not extract below another's.
+static void wrap_root(unzip *u, zarchive *ar, arena scratch)
+{
+    if (!u->yflag || !u->extract || u->hasexdir ||
+        zequals(u->zipfn, S("-"))) {
+        return;
+    }
+    u->root   = S("");
+    u->rooted = 0;
+    i32    opts = (u->windows ? UZ_WINDOWS : 0) |
+                  (u->jflag ? UZ_JUNK : 0) | (u->Vflag ? UZ_KEEPVER : 0);
+    s8     comp = {0};
+    b32    one  = 1;  // so far, all entries under one component
+    i64    off  = ar->end.cdoff;
+    for (i64 i = 0; i < u->nentries && one; i++) {
+        arena  tmp  = scratch;
+        zentry e    = {0};
+        i64    at   = off;
+        next_entry(u, ar, &off, &e, &tmp);
+        s8     name = entry_name(u, &e, &tmp);
+        if (!readable(&e) || !wanted(u, name, 0, 0) || !picked(u, at, &e) ||
+            beyond(ar, &e)) {
+            continue;
+        }
+        uzpath mp = uz_mapname(path_name(u, at, &e, name), e.made, opts, &tmp);
+        if (mp.flags & UZ_FAILED) {
+            continue;
+        }
+        s8 p = mp.path;
+        if (!p.len) {  // an empty name, or a directory entry under -j
+            continue;
+        }
+        iz cut = p.len;  // past the first component, or the whole of it
+        for (iz k = 0; k < p.len; k++) {
+            if (p.s[k]=='/') {
+                cut = k;
+                break;
+            }
+        }
+        s8 first = {p.s, cut};
+        if (!(mp.flags & UZ_DIR)) {
+            one &= cut < p.len;  // a file must sit below a component
+        }
+        if (!first.len) {
+            one = 0;
+        } else if (!comp.s) {
+            comp = JOIN(&scratch, first);  // kept past each entry's room
+        } else {
+            one &= zequals(comp, first);
+        }
+    }
+    if (one) {
+        return;
+    }
+    s8 base = zip_dirname(u);
+    u->root = JOIN(&u->perm, base, S("/"));
+    if (u->qflag < 1) {
+        info(u, 0, JOIN(&scratch, S("note:  extracting into "), base,
+                        S("/\n")));
+    }
+}
+
 // Test the selected entries, or extract them, to disk or standard
 // output, as extract.c's extract_or_test_files.
 static i32 extract_or_test(unzip *u, zarchive *ar, arena scratch)
 {
+    wrap_root(u, ar, scratch);
     i64 count = u->nentries;
     u8 *fm    = new(&scratch, u->fspecs.len, u8);
     u8 *xm    = new(&scratch, u->xspecs.len, u8);
