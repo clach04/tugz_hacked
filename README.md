@@ -2,6 +2,8 @@ Hacked tugz amalgation
 
 Small experiments with code changes, rather than the full code base.
 
+Currently Windows only.
+
 ## unzip `-y` mode
 
     unzip -y file.zip
